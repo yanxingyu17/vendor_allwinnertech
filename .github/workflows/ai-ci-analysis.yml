@@ -1,0 +1,81 @@
+name: AI CI Failure Analysis (demo)
+
+on:
+  push:
+    branches: [ai-ci-demo]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  ai-analyze:
+    runs-on: [self-hosted, openvela-ai]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Real compile (expected to fail), capture log
+        run: |
+          gcc -c test.c -o /tmp/test.o 2> build.log || true
+          echo "===== build.log ====="
+          cat build.log
+
+      - name: AI analyze via local dsh
+        shell: bash
+        run: |
+          set +e
+          export PATH="/home/mi/.nvm/versions/node/v22.23.2/bin:$PATH"
+          export DEEPSEEK_API_KEY=$(python3 -c "import json;print(json.load(open('/home/mi/.config/opencode/opencode.json'))['provider']['Mify-DeepSeek']['options']['apiKey'])")
+          export DEEPSEEK_BASE_URL="https://api.llm.mioffice.cn/v1"
+          export CHOKIDAR_USEPOLLING=1
+          export CHOKIDAR_INTERVAL=1000
+          LOG="$(cat build.log)"
+          PROMPT="你是 openvela 社区 CI 的 AI 失败分析助手。下面是一次真实 CI 编译失败日志。用 ci-failure-analysis skill 分析。请把最终可贴 GitHub PR 的 Markdown 根因分析(一句话结论+根因定位到文件行+修复建议+AI生成需人工确认)完整放在单独一行 ===AI-COMMENT-START=== 之后、单独一行 ===AI-COMMENT-END=== 之前。200字内,中文。 ===日志=== ${LOG} ==="
+          cd /home/mi/work/deepseek-harness
+          timeout 240 pnpm dsh --profile openvela "$PROMPT" > "$GITHUB_WORKSPACE/ai-raw.txt" 2> "$GITHUB_WORKSPACE/ai-err.txt"
+          echo ">>> dsh 退出码: $?"
+          # 主:按标记精确提取
+          awk '/===AI-COMMENT-START===/{f=1;next} /===AI-COMMENT-END===/{f=0} f' "$GITHUB_WORKSPACE/ai-raw.txt" > "$GITHUB_WORKSPACE/ai-out.txt"
+          # 兜底:没提到标记则删 pnpm banner 行后贴原始全文(绝不丢正文)
+          if [ ! -s "$GITHUB_WORKSPACE/ai-out.txt" ]; then
+            grep -vE '^\[WARN\]|^Scope:|Lockfile|^Already up|^packages/|postinstall|^Done in|Update available|^\s*[╭│╰]|^ +$' "$GITHUB_WORKSPACE/ai-raw.txt" > "$GITHUB_WORKSPACE/ai-out.txt"
+          fi
+          echo "===== 提取后的 AI 正文 ====="
+          cat "$GITHUB_WORKSPACE/ai-out.txt"
+          exit 0
+
+      - name: Post comment to PR #1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "## 🤖 AI CI 失败分析（GitHub Actions 自动触发）"
+            echo ""
+            cat "$GITHUB_WORKSPACE/ai-out.txt"
+            echo ""
+            echo "---"
+            echo "_self-hosted runner 上的 dsh 自动生成 · 由 github-actions[bot] 发出_"
+          } > "$GITHUB_WORKSPACE/comment.md"
+          cat > "$GITHUB_WORKSPACE/post.py" <<'PY'
+          import sys, json, urllib.request
+          token, body_path = sys.argv[1], sys.argv[2]
+          body = open(body_path, encoding="utf-8").read()
+          req = urllib.request.Request(
+              "https://api.github.com/repos/yanxingyu17/vendor_allwinnertech/issues/1/comments",
+              data=json.dumps({"body": body}).encode(),
+              headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+              method="POST")
+          try:
+              r = urllib.request.urlopen(req)
+              print("comment posted, HTTP", r.status)
+          except Exception as e:
+              print("comment failed:", e)
+              try: print(e.read().decode())
+              except Exception: pass
+          PY
+          python3 "$GITHUB_WORKSPACE/post.py" "$GH_TOKEN" "$GITHUB_WORKSPACE/comment.md"
+          exit 0
