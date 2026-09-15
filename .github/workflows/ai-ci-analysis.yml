@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   ai-analyze:
@@ -21,7 +22,7 @@ jobs:
           echo "===== build.log ====="
           cat build.log
 
-      - name: AI analyze via local dsh (resilient, stderr exposed)
+      - name: AI analyze via local dsh
         shell: bash
         run: |
           set +e
@@ -33,21 +34,17 @@ jobs:
           LOG="$(cat build.log)"
           PROMPT="你是 openvela 社区 CI 的 AI 失败分析助手。下面是一次真实 CI 编译失败日志。用 ci-failure-analysis skill 分析,输出可直接贴 GitHub PR 的 Markdown 根因分析:一句话结论 + 根因(定位到文件/行) + 修复建议 + 这是AI生成需人工确认。200字内,中文。 ===日志=== ${LOG} ==="
           cd /home/mi/work/deepseek-harness
-          echo ">>> 调用 dsh (stderr 全程可见)"
           timeout 240 pnpm dsh --profile openvela "$PROMPT" > "$GITHUB_WORKSPACE/ai-raw.txt" 2> "$GITHUB_WORKSPACE/ai-err.txt"
           DSH_CODE=$?
           echo ">>> dsh 退出码: $DSH_CODE"
-          echo "===== dsh stderr (关键诊断信息) ====="
-          cat "$GITHUB_WORKSPACE/ai-err.txt" || true
-          echo "===== dsh stdout ====="
-          cat "$GITHUB_WORKSPACE/ai-raw.txt" || true
-          # dsh 的 stdout 混有 pnpm banner,取最后一段非空正文作为 AI 分析
-          if [ "$DSH_CODE" = "0" ] && [ -s "$GITHUB_WORKSPACE/ai-raw.txt" ]; then
-            cp "$GITHUB_WORKSPACE/ai-raw.txt" "$GITHUB_WORKSPACE/ai-out.txt"
-          else
-            echo "AI 分析失败 (dsh 退出码 $DSH_CODE)，stderr：" > "$GITHUB_WORKSPACE/ai-out.txt"
+          # 只取从第一个 Markdown 标题开始的正文，滤掉 pnpm 启动横幅噪声
+          awk '/^#/{f=1} f' "$GITHUB_WORKSPACE/ai-raw.txt" > "$GITHUB_WORKSPACE/ai-out.txt"
+          if [ ! -s "$GITHUB_WORKSPACE/ai-out.txt" ]; then
+            echo "AI 分析无有效输出 (dsh 退出码 $DSH_CODE)" > "$GITHUB_WORKSPACE/ai-out.txt"
             tail -5 "$GITHUB_WORKSPACE/ai-err.txt" >> "$GITHUB_WORKSPACE/ai-out.txt" 2>/dev/null || true
           fi
+          echo "===== 提取后的 AI 正文 ====="
+          cat "$GITHUB_WORKSPACE/ai-out.txt"
           exit 0
 
       - name: Post comment to PR #1
@@ -63,19 +60,24 @@ jobs:
             echo ""
             echo "---"
             echo "_self-hosted runner 上的 dsh 自动生成 · 由 github-actions[bot] 发出_"
-          } > comment.md
-          python3 - "$GH_TOKEN" < comment.md <<'PY'
+          } > "$GITHUB_WORKSPACE/comment.md"
+          # 修复:token 与正文文件路径都走参数,python 不碰 stdin(避免 heredoc/stdin 冲突)
+          cat > "$GITHUB_WORKSPACE/post.py" <<'PY'
           import sys, json, urllib.request
-          token = sys.argv[1]
-          body = sys.stdin.read()
+          token, body_path = sys.argv[1], sys.argv[2]
+          body = open(body_path, encoding="utf-8").read()
           req = urllib.request.Request(
               "https://api.github.com/repos/yanxingyu17/vendor_allwinnertech/issues/1/comments",
               data=json.dumps({"body": body}).encode(),
               headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
               method="POST")
           try:
-              print("HTTP", urllib.request.urlopen(req).status)
+              r = urllib.request.urlopen(req)
+              print("comment posted, HTTP", r.status)
           except Exception as e:
               print("comment failed:", e)
+              try: print(e.read().decode())
+              except Exception: pass
           PY
+          python3 "$GITHUB_WORKSPACE/post.py" "$GH_TOKEN" "$GITHUB_WORKSPACE/comment.md"
           exit 0
