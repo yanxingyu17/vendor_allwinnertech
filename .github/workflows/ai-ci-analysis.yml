@@ -32,16 +32,15 @@ jobs:
           export CHOKIDAR_USEPOLLING=1
           export CHOKIDAR_INTERVAL=1000
           LOG="$(cat build.log)"
-          PROMPT="你是 openvela 社区 CI 的 AI 失败分析助手。下面是一次真实 CI 编译失败日志。用 ci-failure-analysis skill 分析,输出可直接贴 GitHub PR 的 Markdown 根因分析:一句话结论 + 根因(定位到文件/行) + 修复建议 + 这是AI生成需人工确认。200字内,中文。 ===日志=== ${LOG} ==="
+          PROMPT="你是 openvela 社区 CI 的 AI 失败分析助手。下面是一次真实 CI 编译失败日志。用 ci-failure-analysis skill 分析。请把最终可贴 GitHub PR 的 Markdown 根因分析(一句话结论+根因定位到文件行+修复建议+AI生成需人工确认)完整放在单独一行 ===AI-COMMENT-START=== 之后、单独一行 ===AI-COMMENT-END=== 之前。200字内,中文。 ===日志=== ${LOG} ==="
           cd /home/mi/work/deepseek-harness
           timeout 240 pnpm dsh --profile openvela "$PROMPT" > "$GITHUB_WORKSPACE/ai-raw.txt" 2> "$GITHUB_WORKSPACE/ai-err.txt"
-          DSH_CODE=$?
-          echo ">>> dsh 退出码: $DSH_CODE"
-          # 只取从第一个 Markdown 标题开始的正文，滤掉 pnpm 启动横幅噪声
-          awk '/^#/{f=1} f' "$GITHUB_WORKSPACE/ai-raw.txt" > "$GITHUB_WORKSPACE/ai-out.txt"
+          echo ">>> dsh 退出码: $?"
+          # 主:按标记精确提取
+          awk '/===AI-COMMENT-START===/{f=1;next} /===AI-COMMENT-END===/{f=0} f' "$GITHUB_WORKSPACE/ai-raw.txt" > "$GITHUB_WORKSPACE/ai-out.txt"
+          # 兜底:没提到标记则删 pnpm banner 行后贴原始全文(绝不丢正文)
           if [ ! -s "$GITHUB_WORKSPACE/ai-out.txt" ]; then
-            echo "AI 分析无有效输出 (dsh 退出码 $DSH_CODE)" > "$GITHUB_WORKSPACE/ai-out.txt"
-            tail -5 "$GITHUB_WORKSPACE/ai-err.txt" >> "$GITHUB_WORKSPACE/ai-out.txt" 2>/dev/null || true
+            grep -vE '^\[WARN\]|^Scope:|Lockfile|^Already up|^packages/|postinstall|^Done in|Update available|^\s*[╭│╰]|^ +$' "$GITHUB_WORKSPACE/ai-raw.txt" > "$GITHUB_WORKSPACE/ai-out.txt"
           fi
           echo "===== 提取后的 AI 正文 ====="
           cat "$GITHUB_WORKSPACE/ai-out.txt"
@@ -61,7 +60,6 @@ jobs:
             echo "---"
             echo "_self-hosted runner 上的 dsh 自动生成 · 由 github-actions[bot] 发出_"
           } > "$GITHUB_WORKSPACE/comment.md"
-          # 修复:token 与正文文件路径都走参数,python 不碰 stdin(避免 heredoc/stdin 冲突)
           cat > "$GITHUB_WORKSPACE/post.py" <<'PY'
           import sys, json, urllib.request
           token, body_path = sys.argv[1], sys.argv[2]
